@@ -22,11 +22,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/actions-lockfile/go/pkg/lockfile"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"go.uber.org/mock/gomock"
 
-	"github.com/github/actions-lockfile/go/pkg/lockfile"
 	"github.com/ossf/scorecard/v5/checker"
 	mockrepo "github.com/ossf/scorecard/v5/clients/mockclients"
 	"github.com/ossf/scorecard/v5/finding"
@@ -246,10 +246,10 @@ func TestActionPinnedByLockfile(t *testing.T) {
 	}
 
 	tests := []struct {
+		lf       *lockfile.File
 		desc     string
 		pathfn   string
 		uses     string
-		lf       *lockfile.File
 		ispinned bool
 	}{
 		{
@@ -317,13 +317,13 @@ func TestSelfRepositoryActionResolvesAgainstRepoRoot(t *testing.T) {
 	}
 
 	tests := []struct {
+		lf   *lockfile.File
 		desc string
 		uses string
 		// pathfn simulates workflow files defined at various (possibly
 		// nested) locations. A correct, repo-root-relative resolution of
 		// `uses` must not depend on this value at all.
 		pathfn string
-		lf     *lockfile.File
 	}{
 		{
 			desc:   "bare repo root reference, no lockfile, workflow at top-level",
