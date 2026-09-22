@@ -18,11 +18,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"path/filepath"
+	"path"
 	"reflect"
 	"regexp"
 	"strings"
 
+	"github.com/github/actions-lockfile/go/pkg/lockfile"
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/rhysd/actionlint"
 
@@ -323,7 +324,9 @@ func collectDockerfileInsecureDownloads(c *checker.CheckRequest, r *checker.Pinn
 }
 
 func fileIsInVendorDir(pathfn string) bool {
-	cleanedPath := filepath.Clean(pathfn)
+	// pathfn is a repo-relative path and always uses "/" as a separator,
+	// regardless of the host OS, so use "path" (not "path/filepath") here.
+	cleanedPath := path.Clean(pathfn)
 	splitCleanedPath := strings.Split(cleanedPath, "/")
 
 	for _, d := range splitCleanedPath {
@@ -710,10 +713,15 @@ var validateGitHubWorkflowIsFreeOfInsecureDownloads fileparser.DoWhileTrueOnFile
 
 // Check pinning of github actions in workflows.
 func collectGitHubActionsWorkflowPinning(c *checker.CheckRequest, r *checker.PinningDependenciesData) error {
-	err := fileparser.OnMatchingFileContentDo(c.RepoClient, fileparser.PathMatcher{
+	lf, err := loadActionsLockfile(c)
+	if err != nil {
+		return err
+	}
+
+	err = fileparser.OnMatchingFileContentDo(c.RepoClient, fileparser.PathMatcher{
 		Pattern:       ".github/workflows/*",
 		CaseSensitive: true,
-	}, validateGitHubActionWorkflow, r)
+	}, validateGitHubActionWorkflow, r, lf)
 	if err != nil {
 		return err
 	}
@@ -722,6 +730,39 @@ func collectGitHubActionsWorkflowPinning(c *checker.CheckRequest, r *checker.Pin
 
 	applyWorkflowPinningRemediations(remediationMetadata, r.Dependencies)
 	return nil
+}
+
+// loadActionsLockfile loads and parses the github/gh-actions-lock lockfile
+// (`.github/workflows/actions.lock`), if present. The lockfile records, per
+// workflow, the exact set of action pins (`OWNER/REPO@REF`) that gh-actions-lock
+// has resolved and verifies at runtime, so a `uses:` reference that matches an
+// entry recorded for its workflow is effectively pinned even when it uses a
+// mutable tag or branch name.
+//
+// A missing, malformed, or unsupported-version lockfile is not an error: we
+// simply fall back to the standard SHA-based pin detection.
+func loadActionsLockfile(c *checker.CheckRequest) (*lockfile.File, error) {
+	var lf *lockfile.File
+	var collect fileparser.DoWhileTrueOnFileContent = func(
+		pathfn string, content []byte, args ...interface{},
+	) (bool, error) {
+		parsed, err := lockfile.Parse(content)
+		if err != nil {
+			//nolint:nilerr // intentional: fall back to standard pin detection on a malformed lockfile.
+			return false, nil
+		}
+		lf = &parsed
+		return false, nil
+	}
+
+	err := fileparser.OnMatchingFileContentDo(c.RepoClient, fileparser.PathMatcher{
+		Pattern:       lockfile.Path,
+		CaseSensitive: true,
+	}, collect)
+	if err != nil {
+		return nil, err
+	}
+	return lf, nil
 }
 
 func applyWorkflowPinningRemediations(rm *remediation.RemediationMetadata, d []checker.Dependency) {
@@ -745,11 +786,15 @@ var validateGitHubActionWorkflow fileparser.DoWhileTrueOnFileContent = func(
 		return true, nil
 	}
 
-	if len(args) != 1 {
+	if len(args) != 2 {
 		return false, fmt.Errorf(
-			"validateGitHubActionWorkflow requires exactly 1 arguments: got %v: %w", len(args), errInvalidArgLength)
+			"validateGitHubActionWorkflow requires exactly 2 arguments: got %v: %w", len(args), errInvalidArgLength)
 	}
 	pdata := dataAsPinnedDependenciesPointer(args[0])
+	lf, ok := args[1].(*lockfile.File)
+	if !ok {
+		lf = nil
+	}
 
 	if !fileparser.CheckFileContainsCommands(content, "#") {
 		return true, nil
@@ -772,7 +817,7 @@ var validateGitHubActionWorkflow fileparser.DoWhileTrueOnFileContent = func(
 			// Check whether this is an action defined in the same repo,
 			// https://docs.github.com/en/actions/learn-github-actions/finding-and-customizing-actions#referencing-an-action-in-the-same-repository-where-a-workflow-file-uses-the-action.
 			if !strings.HasPrefix(job.WorkflowCall.Uses.Value, "./") {
-				dep := newGHActionDependency(job.WorkflowCall.Uses.Value, pathfn, job.WorkflowCall.Uses.Pos.Line)
+				dep := newGHActionDependency(job.WorkflowCall.Uses.Value, pathfn, job.WorkflowCall.Uses.Pos.Line, lf)
 				pdata.Dependencies = append(pdata.Dependencies, dep)
 			}
 		}
@@ -800,7 +845,7 @@ var validateGitHubActionWorkflow fileparser.DoWhileTrueOnFileContent = func(
 			if strings.HasPrefix(execAction.Uses.Value, "./") {
 				continue
 			}
-			dep := newGHActionDependency(execAction.Uses.Value, pathfn, execAction.Uses.Pos.Line)
+			dep := newGHActionDependency(execAction.Uses.Value, pathfn, execAction.Uses.Pos.Line, lf)
 			pdata.Dependencies = append(pdata.Dependencies, dep)
 		}
 	}
@@ -808,7 +853,7 @@ var validateGitHubActionWorkflow fileparser.DoWhileTrueOnFileContent = func(
 	return true, nil
 }
 
-func newGHActionDependency(uses, pathfn string, line int) checker.Dependency {
+func newGHActionDependency(uses, pathfn string, line int, lf *lockfile.File) checker.Dependency {
 	dep := checker.Dependency{
 		Location: &checker.File{
 			Path:      pathfn,
@@ -817,7 +862,7 @@ func newGHActionDependency(uses, pathfn string, line int) checker.Dependency {
 			EndOffset: uint(line), // `Uses` always span a single line.
 			Snippet:   uses,
 		},
-		Pinned: asBoolPointer(isActionDependencyPinned(uses)),
+		Pinned: asBoolPointer(isActionDependencyPinned(uses, pathfn, lf)),
 		Type:   checker.DependencyUseTypeGHAction,
 	}
 	parts := strings.SplitN(uses, "@", 2)
@@ -830,7 +875,17 @@ func newGHActionDependency(uses, pathfn string, line int) checker.Dependency {
 	return dep
 }
 
-func isActionDependencyPinned(actionUses string) bool {
+func isActionDependencyPinned(actionUses, pathfn string, lf *lockfile.File) bool {
+	// `$/...` references a same-repository action or reusable workflow,
+	// resolved at the running commit by gh-actions-lock. It is inherently
+	// pinned, regardless of any trailing `@ref` (which gh-actions-lock rejects
+	// anyway), so no lockfile entry is required.
+	// https://github.com/github/gh-actions-lock#self-repository-actions--
+	selfRepoActionRegex := regexp.MustCompile(`^\$/`)
+	if selfRepoActionRegex.MatchString(actionUses) {
+		return true
+	}
+
 	localActionRegex := regexp.MustCompile(`^\..+[^/]`)
 	if localActionRegex.MatchString(actionUses) {
 		return true
@@ -842,5 +897,61 @@ func isActionDependencyPinned(actionUses string) bool {
 	}
 
 	dockerhubActionRegex := regexp.MustCompile(`docker://.*@sha256:[a-fA-F\d]{64}`)
-	return dockerhubActionRegex.MatchString(actionUses)
+	if dockerhubActionRegex.MatchString(actionUses) {
+		return true
+	}
+
+	return isActionPinnedByLockfile(actionUses, pathfn, lf)
+}
+
+// isActionPinnedByLockfile reports whether actionUses is recorded as a pin for
+// pathfn in a github/gh-actions-lock lockfile (`.github/workflows/actions.lock`).
+// gh-actions-lock verifies, at runtime, that the resolved commit for every
+// onboarded workflow dependency matches the lockfile entry, so a `uses:` value
+// that matches its workflow's recorded pin key is effectively pinned even
+// though the reference itself is a mutable tag or branch.
+// https://github.com/github/gh-actions-lock
+func isActionPinnedByLockfile(actionUses, pathfn string, lf *lockfile.File) bool {
+	if lf == nil {
+		return false
+	}
+
+	pins, ok := lf.LookupWorkflow(pathfn)
+	if !ok {
+		return false
+	}
+
+	key, ok := actionLockfileKey(actionUses)
+	if !ok {
+		return false
+	}
+
+	for _, pin := range pins {
+		if pin == key {
+			return true
+		}
+	}
+	return false
+}
+
+// actionLockfileKey normalizes a workflow `uses:` value down to the
+// repo-scoped pin key (`OWNER/REPO@REF`) used by the lockfile. A `uses:` value
+// may reference a sub-path within an action's repo (e.g. `actions/cache/save@v4`),
+// but gh-actions-lock pins are recorded at repo+ref granularity, matching the
+// runner, which downloads `owner/repo@ref` once and reuses the tree for any
+// sub-action path.
+func actionLockfileKey(actionUses string) (string, bool) {
+	atIdx := strings.IndexByte(actionUses, '@')
+	if atIdx <= 0 || atIdx == len(actionUses)-1 {
+		return "", false
+	}
+	repoPath := actionUses[:atIdx]
+	ref := actionUses[atIdx+1:]
+
+	parts := strings.SplitN(repoPath, "/", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return "", false
+	}
+
+	return lockfile.IndexKey(parts[0], parts[1], ref), true
 }
